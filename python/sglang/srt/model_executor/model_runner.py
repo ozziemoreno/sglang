@@ -230,14 +230,53 @@ class ModelRunner:
     def setup_model(self):
         try:
             from vllm.config import VllmConfig
+            from vllm.config import ParallelConfig, CacheConfig, SchedulerConfig
+            from vllm.model_executor.model_loader.weight_utils import get_quant_config
 
-            vllm_config = VllmConfig()
-            vllm_config.model_config = self.vllm_model_config
-            vllm_config.load_config = self.load_config
-            vllm_config.device_config = DeviceConfig(self.device)
-            vllm_config.quant_config = VllmConfig._get_quantization_config(
-                vllm_config.model_config, vllm_config.load_config
+            vllm_config: VllmConfig
+
+            block_size: int = 16
+            swap_space: float = 4
+            max_num_seqs: int = 256
+            max_num_batched_tokens: Optional[int] = None
+            max_model_len: Optional[int] = None
+            #task: TaskOption = "auto"
+            task: str = "auto"
+            pipeline_parallel_size: int = 1
+            tensor_parallel_size: int = self.server_args.tp_size if self.server_args.tp_size else 1
+
+            parallel_config = ParallelConfig(
+                                pipeline_parallel_size=pipeline_parallel_size,
+                                tensor_parallel_size=tensor_parallel_size
             )
+            
+            cache_config = CacheConfig(
+                            block_size=block_size, 
+                            gpu_memory_utilization=self.server_args.mem_fraction_static, 
+                            swap_space=swap_space, 
+                            cache_dtype=self.server_args.kv_cache_dtype
+            )
+
+            scheduler_config = SchedulerConfig(
+                                task=task, 
+                                max_num_batched_tokens=max_num_batched_tokens, 
+                                max_num_seqs=max_num_seqs, 
+                                max_model_len=self.vllm_model_config.max_model_len
+            )
+
+            vllm_config = VllmConfig(
+                            model_config=self.vllm_model_config,
+                            cache_config=cache_config,
+                            parallel_config=parallel_config,
+                            scheduler_config=scheduler_config,
+                            device_config=DeviceConfig(self.device),
+                            load_config=self.load_config
+            )
+
+            if self.server_args.quantization:
+                vllm_config.quant_config = get_quant_config(
+                    vllm_config.model_config, vllm_config.load_config
+                )
             return get_model(vllm_config=vllm_config)
         except ImportError:
             return get_model(
