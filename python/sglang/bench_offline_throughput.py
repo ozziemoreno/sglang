@@ -1,20 +1,13 @@
 """
-Benchmark the throughput of using the offline LLM engine.
-This script does not launch a server.
+Benchmark the throughput in the offline mode.
 It accepts server arguments (the same as launch_server.py) and benchmark arguments (the same as bench_serving.py).
 
 # Usage
 ## Sharegpt dataset with default args
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --num-prompts 10
 
 ## Random dataset with default args
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dataset-name random
-
-## Shared prefix dataset with default args
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dataset-name generated-shared-prefix
-
-## Sharegpt dataset on runtime backend
-python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --backend runtime
+python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --dataset-name random --random-input 1024 --random-output 1024
 """
 
 import argparse
@@ -57,6 +50,7 @@ class BenchArgs:
     disable_ignore_eos: bool = False
     extra_request_body: Optional[str] = None
     seed: int = 1
+    skip_warmup: bool = False
     do_not_exit: bool = False
 
     @staticmethod
@@ -152,6 +146,11 @@ class BenchArgs:
             "additional generate params like sampling params.",
         )
         parser.add_argument("--seed", type=int, default=1, help="The random seed.")
+        parser.add_argument(
+            "--skip-warmup",
+            action="store_true",
+            help="Skip the warmup batches.",
+        )
         parser.add_argument(
             "--do-not-exit",
             action="store_true",
@@ -261,14 +260,15 @@ def throughput_test(
     )
 
     # Warm up
-    logging.info("\nWarmup...")
-    throughput_test_once(
-        backend_name=bench_args.backend,
-        backend=backend,
-        reqs=warmup_requests,
-        ignore_eos=not bench_args.disable_ignore_eos,
-        extra_request_body=extra_request_body,
-    )
+    if not bench_args.skip_warmup:
+        logging.info("\nWarmup...")
+        throughput_test_once(
+            backend_name=bench_args.backend,
+            backend=backend,
+            reqs=warmup_requests,
+            ignore_eos=not bench_args.disable_ignore_eos,
+            extra_request_body=extra_request_body,
+        )
 
     logging.info("\nBenchmark...")
     result = throughput_test_once(

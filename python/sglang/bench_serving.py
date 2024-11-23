@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import json
 import os
+import pickle
 import random
 import resource
 import sys
@@ -387,6 +388,24 @@ async def async_request_gserver(
     raise NotImplementedError()
 
 
+async def async_request_profile(api_url: str) -> RequestFuncOutput:
+    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        output = RequestFuncOutput()
+        try:
+            async with session.post(url=api_url) as response:
+                if response.status == 200:
+                    output.success = True
+                else:
+                    output.error = response.reason or ""
+                    output.success = False
+        except Exception:
+            output.success = False
+            exc_info = sys.exc_info()
+            output.error = "".join(traceback.format_exception(*exc_info))
+
+    return output
+
+
 def get_model(pretrained_model_name_or_path: str) -> str:
     if os.getenv("SGLANG_USE_MODELSCOPE", "False").lower() == "true":
         import huggingface_hub.constants
@@ -682,6 +701,11 @@ def sample_generated_shared_prefix_requests(
     output_len: int,
     tokenizer: PreTrainedTokenizerBase,
 ) -> List[Tuple[str, int, int]]:
+    if args.generated_input_path and os.path.exists(args.generated_input_path):
+        print(f"\nloading generated input data from {args.generated_input_path}")
+        with open(args.generated_input_path, "rb") as f:
+            return pickle.load(f)
+
     """Generate benchmark requests with shared system prompts using random tokens."""
     # Generate system prompts for each group
     system_prompts = []
@@ -694,6 +718,9 @@ def sample_generated_shared_prefix_requests(
     for _ in range(num_groups * prompts_per_group):
         question = gen_prompt(tokenizer, question_len)
         questions.append(question)
+
+    # Shuffle questions
+    random.shuffle(questions)
 
     # Combine system prompts with questions
     input_requests = []
@@ -723,6 +750,11 @@ def sample_generated_shared_prefix_requests(
     print(
         f"Average question length: {sum(len(tokenizer.encode(q)) for q in questions) / len(questions):.1f} tokens\n"
     )
+    if args.generated_input_save_path:
+        print(f"Saving generated input data to {args.generated_input_save_path}")
+        os.makedirs(os.path.dirname(args.generated_input_save_path), exist_ok=True)
+        with open(args.generated_input_save_path, "wb") as f:
+            pickle.dump(input_requests, f)
 
     return input_requests
 
@@ -822,12 +854,14 @@ def calculate_metrics(
 async def benchmark(
     backend: str,
     api_url: str,
+    base_url: str,
     model_id: str,
     tokenizer: PreTrainedTokenizerBase,
     input_requests: List[Tuple[str, int, int]],
     request_rate: float,
     disable_tqdm: bool,
     extra_request_body: Dict[str, Any],
+    profile: bool,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -855,6 +889,14 @@ async def benchmark(
 
     time.sleep(1.5)
 
+    if profile:
+        print("Starting profiler...")
+        profile_output = await async_request_profile(
+            api_url=base_url + "/start_profile"
+        )
+        if profile_output.success:
+            print("Profiler started")
+
     pbar = None if disable_tqdm else tqdm(total=len(input_requests))
 
     benchmark_start_time = time.perf_counter()
@@ -875,6 +917,12 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+
+    if profile:
+        print("Stopping profiler...")
+        profile_output = await async_request_profile(api_url=base_url + "/stop_profile")
+        if profile_output.success:
+            print("Profiler stopped")
 
     if pbar is not None:
         pbar.close()
@@ -1100,6 +1148,9 @@ def run_benchmark(args_: argparse.Namespace):
             if args.base_url
             else f"http://{args.host}:{args.port}/v1/models/model:predict"
         )
+    base_url = (
+        f"http://{args.host}:{args.port}" if args.base_url is None else args.base_url
+    )
 
     # Get model name
     if args.model is None:
@@ -1145,12 +1196,14 @@ def run_benchmark(args_: argparse.Namespace):
             benchmark(
                 backend=backend,
                 api_url=api_url,
+                base_url=base_url,
                 model_id=model_id,
                 tokenizer=tokenizer,
                 input_requests=input_requests,
                 request_rate=args.request_rate,
                 disable_tqdm=args.disable_tqdm,
                 extra_request_body=extra_request_body,
+                profile=args.profile,
             )
         )
     else:
@@ -1162,12 +1215,14 @@ def run_benchmark(args_: argparse.Namespace):
                 benchmark(
                     backend=backend,
                     api_url=api_url,
+                    base_url=base_url,
                     model_id=model_id,
                     tokenizer=tokenizer,
                     input_requests=input_requests,
                     request_rate=rate,
                     disable_tqdm=args.disable_tqdm,
                     extra_request_body=extra_request_body,
+                    profile=args.profile,
                 )
             )
 
@@ -1331,6 +1386,21 @@ if __name__ == "__main__":
         default=256,
         help="Target length in tokens for outputs in generated-shared-prefix dataset",
     )
-
+    parser.add_argument(
+        "--generated-input-save-path",
+        type=str,
+        help="Path to save generated input data",
+    )
+    parser.add_argument(
+        "--generated-input-path",
+        type=str,
+        help="Path to load previously generated input data",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Use Torch Profiler. The endpoint must be launched with "
+        "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
     args = parser.parse_args()
     run_benchmark(args)

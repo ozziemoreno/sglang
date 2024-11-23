@@ -1,18 +1,16 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """Constrained decoding with outlines backend."""
 
 import json
@@ -87,9 +85,12 @@ class OutlinesGrammar(BaseGrammarObject):
         return torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        tokens = torch.tensor(
+            self.guide.get_next_instruction(self.state).tokens, dtype=torch.int64
+        ).to(vocab_mask.device, non_blocking=True)
         vocab_mask = vocab_mask[idx]
         vocab_mask.fill_(1)
-        vocab_mask[self.guide.get_next_instruction(self.state).tokens] = 0
+        vocab_mask.scatter_(0, tokens, torch.zeros_like(tokens, dtype=torch.bool))
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor):

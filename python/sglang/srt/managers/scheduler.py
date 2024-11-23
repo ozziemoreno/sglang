@@ -1,20 +1,19 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import dataclasses
 import logging
 import os
 import threading
@@ -29,16 +28,19 @@ import torch
 import zmq
 
 from sglang.global_config import global_config
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
     BatchTokenIDOut,
+    CloseSessionReqInput,
     FlushCacheReq,
     GetMemPoolSizeReq,
     GetMemPoolSizeReqOutput,
+    OpenSessionReqInput,
+    OpenSessionReqOutput,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -58,11 +60,13 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     broadcast_pyobj,
@@ -100,9 +104,12 @@ class Scheduler:
         self.disable_jump_forward = server_args.disable_jump_forward
         self.lora_paths = server_args.lora_paths
         self.max_loras_per_batch = server_args.max_loras_per_batch
-        self.enable_overlap = server_args.enable_overlap_schedule
+        self.enable_overlap = not server_args.disable_overlap_schedule
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.enable_metrics = server_args.enable_metrics
+
+        # Session info
+        self.sessions = {}
 
         # Init inter-process communication
         context = zmq.Context(2)
@@ -156,6 +163,14 @@ class Scheduler:
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                 )
+
+        # Check whether overlap can be enabled
+        if not self.is_generation:
+            self.enable_overlap = False
+            logger.info("Overlap scheduler is disabled for embedding models.")
+
+        if self.enable_overlap:
+            self.disable_jump_forward = True
 
         # Launch a tensor parallel worker
         if self.enable_overlap:
@@ -220,8 +235,12 @@ class Scheduler:
 
         # Init running status
         self.waiting_queue: List[Req] = []
+        # The running decoding batch for continuous batching
         self.running_batch: Optional[ScheduleBatch] = None
+        # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
+        # The current forward batch
+        self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
@@ -336,15 +355,12 @@ class Scheduler:
 
     @torch.no_grad()
     def event_loop_normal(self):
-        """A normal blocking scheduler loop."""
-        self.last_batch = None
-
+        """A normal scheduler loop."""
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
             batch = self.get_next_batch_to_run()
-
             if self.server_args.enable_dp_attention:
                 batch = self.prepare_dp_attn_batch(batch)
 
@@ -353,20 +369,8 @@ class Scheduler:
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
-
-                # Decode multiple steps to reduce the overhead
-                if batch.forward_mode.is_decode():
-                    for _ in range(self.server_args.num_continuous_decode_steps - 1):
-                        if not self.running_batch:
-                            break
-                        self.update_running_batch()
-                        if not self.running_batch:
-                            break
-                        if self.server_args.enable_dp_attention:
-                            batch = self.prepare_dp_attn_batch(batch)
-                        result = self.run_batch(batch)
-                        self.process_batch_result(batch, result)
             else:
+                # Self-check and re-init some states when the server is idle
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
@@ -376,9 +380,6 @@ class Scheduler:
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         result_queue = deque()
-
-        self.last_batch = None
-        self.running_batch = None
 
         while True:
             recv_reqs = self.recv_requests()
@@ -390,10 +391,24 @@ class Scheduler:
                 result = self.run_batch(batch)
                 result_queue.append((batch.copy(), result))
 
+                if self.last_batch is None:
+                    # A dummy first batch to start the pipeline for overlap scheduler.
+                    # It is now used for triggering the sampling_info_done event.
+                    tmp_batch = ScheduleBatch(
+                        reqs=None,
+                        forward_mode=ForwardMode.DUMMY_FIRST,
+                        next_batch_sampling_info=self.tp_worker.cur_sampling_info,
+                    )
+                    self.process_batch_result(tmp_batch, None)
+
             if self.last_batch:
                 tmp_batch, tmp_result = result_queue.popleft()
+                tmp_batch.next_batch_sampling_info = (
+                    self.tp_worker.cur_sampling_info if batch else None
+                )
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
+                # Self-check and re-init some states when the server is idle
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
 
@@ -490,6 +505,11 @@ class Scheduler:
                     self.start_profile()
                 else:
                     self.stop_profile()
+            elif isinstance(recv_req, OpenSessionReqInput):
+                session_id = self.open_session(recv_req)
+                self.send_to_tokenizer.send_pyobj(OpenSessionReqOutput(session_id))
+            elif isinstance(recv_req, CloseSessionReqInput):
+                self.close_session(recv_req)
             elif isinstance(recv_req, GetMemPoolSizeReq):
                 self.send_to_tokenizer.send_pyobj(
                     GetMemPoolSizeReqOutput(self.max_total_num_tokens)
@@ -501,14 +521,30 @@ class Scheduler:
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
-        req = Req(
-            recv_req.rid,
-            recv_req.input_text,
-            recv_req.input_ids,
-            recv_req.sampling_params,
-            lora_path=recv_req.lora_path,
-        )
-        req.tokenizer = self.tokenizer
+        if recv_req.session_id is None or recv_req.session_id not in self.sessions:
+            req = Req(
+                recv_req.rid,
+                recv_req.input_text,
+                recv_req.input_ids,
+                recv_req.sampling_params,
+                lora_path=recv_req.lora_path,
+            )
+            req.tokenizer = self.tokenizer
+            if recv_req.session_id is not None:
+                req.finished_reason = FINISH_ABORT(
+                    f"Invalid request: session id {recv_req.session_id} does not exist"
+                )
+                self.waiting_queue.append(req)
+                return
+        else:
+            # Handle sessions
+            session = self.sessions[recv_req.session_id]
+            req, new_session_id = session.create_req(recv_req, self.tokenizer)
+            del self.sessions[recv_req.session_id]
+            self.sessions[new_session_id] = session
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                self.waiting_queue.append(req)
+                return
 
         # Image inputs
         if recv_req.image_inputs is not None:
@@ -518,6 +554,15 @@ class Scheduler:
             req.origin_input_ids = self.pad_input_ids_func(
                 req.origin_input_ids_unpadded, req.image_inputs
             )
+
+            if len(req.origin_input_ids) > self.max_req_input_len:
+                req.finished_reason = FINISH_ABORT(
+                    "Image request length is longer than the KV cache pool size or "
+                    "the max context length aborting because you cannot truncate the image embeds"
+                )
+                req.sampling_params.max_new_tokens = 0
+                self.waiting_queue.append(req)
+                return
 
         req.return_logprob = recv_req.return_logprob
         req.top_logprobs_num = recv_req.top_logprobs_num
@@ -806,7 +851,7 @@ class Scheduler:
             self.tree_cache,
             self.model_config,
         )
-        new_batch.prepare_for_extend()
+        new_batch.prepare_for_extend(self.enable_overlap)
 
         # Mixed-style chunked prefill
         if self.is_mixed_chunk and self.running_batch is not None:
@@ -893,14 +938,16 @@ class Scheduler:
         return ret
 
     def process_batch_result(self, batch: ScheduleBatch, result):
-        if batch.forward_mode.is_idle():
-            return
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
             if batch.is_empty():
                 self.running_batch = None
-        else:
+        elif batch.forward_mode.is_extend():
             self.process_batch_result_prefill(batch, result)
+        elif batch.forward_mode.is_dummy_first():
+            batch.next_batch_sampling_info.update_regex_vocab_mask()
+            torch.cuda.current_stream().synchronize()
+            batch.next_batch_sampling_info.sampling_info_done.set()
 
     def process_batch_result_prefill(self, batch: ScheduleBatch, result):
 
@@ -952,6 +999,11 @@ class Scheduler:
                         )
                 else:
                     req.is_being_chunked -= 1
+
+            if batch.next_batch_sampling_info:
+                batch.next_batch_sampling_info.update_regex_vocab_mask()
+                torch.cuda.current_stream().synchronize()
+                batch.next_batch_sampling_info.sampling_info_done.set()
 
         else:  # embedding or reward model
             embeddings, bid = result
@@ -1021,6 +1073,11 @@ class Scheduler:
                 )
                 if req.top_logprobs_num > 0:
                     req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
+
+        if batch.next_batch_sampling_info:
+            batch.next_batch_sampling_info.update_regex_vocab_mask()
+            torch.cuda.current_stream().synchronize()
+            batch.next_batch_sampling_info.sampling_info_done.set()
 
         self.stream_output(batch.reqs)
 
@@ -1120,6 +1177,7 @@ class Scheduler:
             output_skip_special_tokens = []
             output_spaces_between_special_tokens = []
             output_no_stop_trim = []
+            output_session_ids = []
         else:  # embedding or reward model
             output_embeddings = []
 
@@ -1147,6 +1205,7 @@ class Scheduler:
                         req.sampling_params.spaces_between_special_tokens
                     )
                     output_no_stop_trim.append(req.sampling_params.no_stop_trim)
+                    output_session_ids.append(req.session_id)
 
                     meta_info = {
                         "prompt_tokens": len(req.origin_input_ids),
@@ -1197,6 +1256,7 @@ class Scheduler:
                         output_meta_info,
                         output_finished_reason,
                         output_no_stop_trim,
+                        output_session_ids,
                     )
                 )
             else:  # embedding or reward model
@@ -1299,6 +1359,25 @@ class Scheduler:
         )
         logger.info("Profiler is done")
 
+    def open_session(self, recv_req: OpenSessionReqInput) -> str:
+        # handle error
+        session_id = recv_req.session_id
+        if session_id in self.sessions:
+            logger.warning(f"session id {session_id} already exist, cannot open.")
+        else:
+            self.sessions[session_id] = Session(
+                recv_req.capacity_of_str_len, session_id
+            )
+        return session_id
+
+    def close_session(self, recv_req: CloseSessionReqInput):
+        # handle error
+        session_id = recv_req.session_id
+        if session_id not in self.sessions:
+            logger.warning(f"session id {session_id} does not exist, cannot delete.")
+        else:
+            del self.sessions[session_id]
+
 
 def run_scheduler_process(
     server_args: ServerArgs,
@@ -1308,6 +1387,10 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # [For Router] if env var "DP_RANK" exist, set dp_rank to the value of the env var
+    if dp_rank is None:
+        dp_rank = int(os.getenv("DP_RANK", -1))
+
     if dp_rank is None:
         configure_logger(server_args, prefix=f" TP{tp_rank}")
     else:
@@ -1317,7 +1400,9 @@ def run_scheduler_process(
 
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, dp_rank)
-        pipe_writer.send("ready")
+        pipe_writer.send(
+            {"status": "ready", "max_total_num_tokens": scheduler.max_total_num_tokens}
+        )
         if scheduler.enable_overlap:
             scheduler.event_loop_overlap()
         else:
