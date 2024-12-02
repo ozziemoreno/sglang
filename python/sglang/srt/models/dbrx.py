@@ -24,11 +24,10 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
-from vllm.model_executor.layers.fused_moe import fused_moe
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.transformers_utils.configs.dbrx import DbrxConfig
 
+from sglang.srt.layers.fused_moe_triton import fused_moe
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -43,6 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import set_weight_attrs
 
 
@@ -366,7 +366,6 @@ class DbrxForCausalLM(nn.Module):
         self,
         config: DbrxConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ):
         super().__init__()
         self.config = config
@@ -390,7 +389,7 @@ class DbrxForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.transformer(input_ids, positions, forward_batch)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
